@@ -3,10 +3,6 @@
 ## Version: 0.1
 # Requires: Az.Resources, Microsoft.Graph, and Defender ATP PowerShell modules
 
-$tenantId = ' ' ### Paste your own tenant ID here
-$appId = ' ' ### Paste your own app ID here
-$appSecret = ' ' ### Paste your own app keys here
-
 # Login to Azure with a service principal. It needs to have reader permissions on the subscription.
 $credential = New-Object -TypeName System.Management.Automation.PSCredential ($appId, (ConvertTo-SecureString $appSecret -AsPlainText -Force))
 Connect-AzAccount -ServicePrincipal -TenantId $tenantId -Credential $credential
@@ -95,14 +91,3 @@ foreach ($vm in @($azureVMs)) {
         }
     }
 }
-
-# Example of adding a tag to a Defender for Endpoint device
-$id = 'c634d29e53d0dff06f6d8f6007582e050bdca1b7' # Replace with actual device ID
-
-$body = @{
-    "Value"="test";
-    "Action"="Add";
-}
-
-# Add the tag to a specific Defender for Endpoint device (replace with actual device ID)
-Invoke-RestMethod -Method POST -Headers $headers -Uri https://api.security.microsoft.com/api/machines/$id/tags -Body ($body|ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
