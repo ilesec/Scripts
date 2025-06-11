@@ -3,9 +3,9 @@
 ## Version: 0.1
 # Requires: Az.Resources, Microsoft.Graph, and Defender ATP PowerShell modules
 
-$tenantId = 'f5aa900f-3ca5-4398-9efc-337ee3c8e7bb' ### Paste your own tenant ID here
-$appId = 'ad80dece-1c61-47a6-bbf9-9ad29ee2dc64' ### Paste your own app ID here
-$appSecret = '_il8Q~WuJE.5PYB4q4sMZx4wbQUHzHMlYynCZciO' ### Paste your own app keys here
+$tenantId = ' ' ### Paste your own tenant ID here
+$appId = ' ' ### Paste your own app ID here
+$appSecret = ' ' ### Paste your own app keys here
 
 # Login to Azure with a service principal. It needs to have reader permissions on the subscription.
 $credential = New-Object -TypeName System.Management.Automation.PSCredential ($appId, (ConvertTo-SecureString $appSecret -AsPlainText -Force))
