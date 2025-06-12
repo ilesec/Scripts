@@ -13,6 +13,7 @@ Connect-AzAccount -ServicePrincipal -TenantId $tenantId -Credential $credential
 # Get all Azure VMs and their tags
 $azureVMs = Get-AzVM | Select-Object Name, ResourceGroupName, @{Name="Tags";Expression={$_.Tags}}
 
+# Authenticate and get token with the service principal for MDE API's
 $resourceAppIdUri = 'https://api.securitycenter.windows.com'
 $oAuthUri = "https://login.windows.net/$TenantId/oauth2/token"
 $authBody = [Ordered] @{
@@ -30,9 +31,6 @@ $headers = @{
         Authorization = "Bearer $token"
     }
 
-# Login to Microsoft Graph for Defender for Endpoint
-# $AccessToken = $token | ConvertTo-SecureString -AsPlainText -Force
-# Connect-MgGraph -AccessToken $AccessToken
 
 # Get all Defender for Endpoint devices and their tags
 $defenderDevices = Invoke-RestMethod -Method GET -Headers $headers -Uri "https://api.security.microsoft.com/api/machines" | Select-Object -ExpandProperty value
