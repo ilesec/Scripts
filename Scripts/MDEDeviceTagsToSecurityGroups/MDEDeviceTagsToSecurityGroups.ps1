@@ -1,0 +1,176 @@
+## MDETagsToSecurityGroups, sync MDE Device Tags to Azure AD Security Groups
+## Author: Ilkka Hyvönen
+## Version: 0.2
+# Requires: Microsoft.Graph PowerShell modules
+# Required Microsoft Graph API permissions: Machine.Read.All, Group.ReadWrite.All, Device.Read.All
+
+$tenantId = ' ' ### Paste your own tenant ID here
+$appId = ' ' ### Paste your own app ID here
+$appSecret = ' ' ### Paste your own app secret here
+
+# Authenticate and get token with the service principal for MDE API
+$resourceAppIdUri = 'https://api.securitycenter.windows.com'
+$oAuthUri = "https://login.windows.net/$TenantId/oauth2/token"
+$authBody = [Ordered] @{
+    resource = "$resourceAppIdUri"
+    client_id = "$appId"
+    client_secret = "$appSecret"
+    grant_type = 'client_credentials'
+}
+
+Write-Host "Authenticating to MDE API..."
+$authResponse = Invoke-RestMethod -Method Post -Uri $oAuthUri -Body $authBody -ErrorAction Stop
+$mdeToken = $authResponse.access_token
+
+# Store MDE auth token into header
+$mdeHeaders = @{
+    'Content-Type' = 'application/json'
+    Accept = 'application/json'
+    Authorization = "Bearer $mdeToken"
+}
+
+# Authenticate to Microsoft Graph
+Write-Host "Authenticating to Microsoft Graph..."
+$graphResourceUri = 'https://graph.microsoft.com'
+$graphOAuthUri = "https://login.windows.net/$TenantId/oauth2/token"
+$graphAuthBody = [Ordered] @{
+    resource = "$graphResourceUri"
+    client_id = "$appId"
+    client_secret = "$appSecret"
+    grant_type = 'client_credentials'
+}
+
+$graphAuthResponse = Invoke-RestMethod -Method Post -Uri $graphOAuthUri -Body $graphAuthBody -ErrorAction Stop
+$graphToken = $graphAuthResponse.access_token
+
+# Store Graph auth token into header
+$graphHeaders = @{
+    'Content-Type' = 'application/json'
+    Accept = 'application/json'
+    Authorization = "Bearer $graphToken"
+}
+
+# Get all MDE devices with their tags
+Write-Host "`nFetching MDE devices and their tags..."
+$mdeDevices = Invoke-RestMethod -Method GET -Headers $mdeHeaders -Uri "https://api.securitycenter.microsoft.com/api/machines" | Select-Object -ExpandProperty value
+
+Write-Host "Found $($mdeDevices.Count) MDE devices"
+
+# Collect all unique tags and group devices by tag
+$tagToDevicesMap = @{}
+foreach ($device in $mdeDevices) {
+    if ($device.machineTags -and $device.machineTags.Count -gt 0) {
+        foreach ($tag in $device.machineTags) {
+            if (-not $tagToDevicesMap.ContainsKey($tag)) {
+                $tagToDevicesMap[$tag] = @()
+            }
+            $tagToDevicesMap[$tag] += $device
+        }
+    }
+}
+
+Write-Host "Found $($tagToDevicesMap.Keys.Count) unique tags:`n"
+$tagToDevicesMap.Keys | ForEach-Object {
+    Write-Host "  - $_ ($($tagToDevicesMap[$_].Count) devices)"
+}
+
+# Get all Azure AD Security Groups
+Write-Host "`nFetching Azure AD Security Groups..."
+$aadGroups = Invoke-RestMethod -Method GET -Headers $graphHeaders -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=securityEnabled eq true" | Select-Object -ExpandProperty value
+
+# Process each unique tag
+Write-Host "`nProcessing MDE Tags...`n"
+foreach ($tag in $tagToDevicesMap.Keys) {
+    $mdeDevicesWithTag = $tagToDevicesMap[$tag]
+    
+    Write-Host "Processing MDE Tag: '$tag'"
+    
+    # Check if a corresponding Security Group exists
+    # Naming convention: MDE-Tag-<TagName>
+    $securityGroupName = "MDE-Tag-$tag"
+    $existingGroup = $aadGroups | Where-Object { $_.displayName -eq $securityGroupName }
+    
+    if ($existingGroup) {
+        Write-Host "  Security Group '$securityGroupName' already exists (ID: $($existingGroup.id))"
+        $securityGroupId = $existingGroup.id
+    } else {
+        Write-Host "  Security Group '$securityGroupName' does not exist. Creating..."
+        
+        # Create new Security Group
+        $newGroupBody = @{
+            displayName = $securityGroupName
+            mailNickname = $securityGroupName -replace '[^a-zA-Z0-9]', ''
+            mailEnabled = $false
+            securityEnabled = $true
+            description = "Synced from MDE Tag: $tag"
+        }
+        
+        try {
+            $newGroup = Invoke-RestMethod -Method POST -Headers $graphHeaders -Uri "https://graph.microsoft.com/v1.0/groups" -Body ($newGroupBody | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+            $securityGroupId = $newGroup.id
+            Write-Host "  Successfully created Security Group '$securityGroupName' (ID: $securityGroupId)" -ForegroundColor Green
+        } catch {
+            Write-Host "  Failed to create Security Group '$securityGroupName': $_" -ForegroundColor Red
+            continue
+        }
+    }
+    
+    # Devices with this tag are already in $mdeDevicesWithTag
+    Write-Host "  Processing $($mdeDevicesWithTag.Count) devices with tag '$tag'..."
+    
+    # Get current members of the Security Group
+    Write-Host "  Fetching current members of Security Group..."
+    try {
+        $securityGroupMembers = Invoke-RestMethod -Method GET -Headers $graphHeaders -Uri "https://graph.microsoft.com/v1.0/groups/$securityGroupId/members" | Select-Object -ExpandProperty value
+        Write-Host "    Found $($securityGroupMembers.Count) current members"
+    } catch {
+        Write-Host "    Failed to fetch Security Group members: $_" -ForegroundColor Red
+        $securityGroupMembers = @()
+    }
+    
+    # Sync devices to Security Group
+    Write-Host "  Syncing devices to Security Group..."
+    $devicesAdded = 0
+    $devicesSkipped = 0
+    $devicesFailed = 0
+    
+    foreach ($mdeDevice in $mdeDevicesWithTag) {
+        $deviceName = $mdeDevice.computerDnsName
+        $mdeDeviceId = $mdeDevice.id
+        $azureAdDeviceId = $mdeDevice.aadDeviceId
+        
+        if (-not $azureAdDeviceId) {
+            Write-Host "    Device '$deviceName' has no Azure AD Device ID. Skipping..." -ForegroundColor Yellow
+            $devicesSkipped++
+            continue
+        }
+        
+        # Check if device is already a member
+        $isMember = $securityGroupMembers | Where-Object { $_.id -eq $azureAdDeviceId }
+        
+        if ($isMember) {
+            Write-Host "    Device '$deviceName' is already a member. Skipping..."
+            $devicesSkipped++
+            continue
+        }
+        
+        # Add device to Security Group
+        $addMemberBody = @{
+            "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$azureAdDeviceId"
+        }
+        
+        try {
+            Invoke-RestMethod -Method POST -Headers $graphHeaders -Uri "https://graph.microsoft.com/v1.0/groups/$securityGroupId/members/`$ref" -Body ($addMemberBody | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+            Write-Host "    Added device '$deviceName' to Security Group" -ForegroundColor Green
+            $devicesAdded++
+        } catch {
+            Write-Host "    Failed to add device '$deviceName' to Security Group: $_" -ForegroundColor Red
+            $devicesFailed++
+        }
+    }
+    
+    Write-Host "  Summary: Added: $devicesAdded | Skipped: $devicesSkipped | Failed: $devicesFailed"
+    Write-Host ""
+}
+
+Write-Host "`nSync completed!" -ForegroundColor Green
