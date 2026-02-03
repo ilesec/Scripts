@@ -29,14 +29,99 @@ param(
     [int]$Days = 30,
 
     [Parameter()]
-    [string]$ExportPath
+    [ValidateNotNullOrEmpty()]
+    [string]$ExportPath = $null
 )
+
+# Show export path if specified
+if ($ExportPath) {
+    Write-Host "Export path: $ExportPath" -ForegroundColor Cyan
+}
 
 # Required Graph API permissions
 $requiredScopes = @(
     "AuditLog.Read.All",
-    "Directory.Read.All"
+    "Directory.Read.All",
+    "Application.Read.All"
 )
+
+# Function to get app registration details
+function Get-AppRegistrationDetails {
+    param(
+        [string]$AppId
+    )
+    
+    try {
+        $app = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$AppId'" -OutputType PSObject
+        if ($app.value -and $app.value.Count -gt 0) {
+            return $app.value[0]
+        }
+    }
+    catch {
+        # App might be a Microsoft first-party app or external
+    }
+    
+    return $null
+}
+
+# Function to get service principal permissions
+function Get-ServicePrincipalPermissions {
+    param(
+        [string]$AppId
+    )
+    
+    $permissions = @{
+        Application = @()
+        Delegated = @()
+    }
+    
+    try {
+        # First get the service principal ID from the AppId
+        $spLookup = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$AppId'" -OutputType PSObject
+        if (-not $spLookup.value -or $spLookup.value.Count -eq 0) {
+            return $permissions
+        }
+        $spId = $spLookup.value[0].id
+        
+        # Get App Role Assignments (Application permissions)
+        $appRoleAssignments = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignments" -OutputType PSObject
+        
+        foreach ($assignment in $appRoleAssignments.value) {
+            try {
+                $resourceSp = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($assignment.resourceId)" -OutputType PSObject
+                $roleName = ($resourceSp.appRoles | Where-Object { $_.id -eq $assignment.appRoleId }).value
+                if (-not $roleName) { $roleName = $assignment.appRoleId }
+                
+                $permissions.Application += "$($assignment.resourceDisplayName): $roleName"
+            }
+            catch {
+                $permissions.Application += "$($assignment.resourceDisplayName): $($assignment.appRoleId)"
+            }
+        }
+        
+        # Get OAuth2 Permission Grants (Delegated permissions)
+        $oauth2Grants = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/oauth2PermissionGrants" -OutputType PSObject
+        
+        foreach ($grant in $oauth2Grants.value) {
+            $scopes = $grant.scope -split ' ' | Where-Object { $_ }
+            foreach ($scope in $scopes) {
+                # Get resource display name
+                try {
+                    $resourceSp = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($grant.resourceId)" -OutputType PSObject
+                    $permissions.Delegated += "$($resourceSp.displayName): $scope"
+                }
+                catch {
+                    $permissions.Delegated += "$($grant.resourceId): $scope"
+                }
+            }
+        }
+    }
+    catch {
+        # Silently continue if we can't get permissions
+    }
+    
+    return $permissions
+}
 
 Write-Host "=== Service Principal Sign-In Report ===" -ForegroundColor Cyan
 Write-Host "Checking Microsoft Graph connection..." -ForegroundColor Yellow
@@ -59,28 +144,36 @@ if (-not $context) {
 Write-Host "Connected as: $($context.Account)" -ForegroundColor Green
 Write-Host "Tenant ID: $($context.TenantId)" -ForegroundColor Green
 
-# Calculate the date filter
-$startDate = (Get-Date).AddDays(-$Days).ToString("yyyy-MM-ddTHH:mm:ssZ")
-Write-Host "`nRetrieving service principal sign-ins from the last $Days days..." -ForegroundColor Yellow
+# Calculate the date filter - use UTC and proper ISO 8601 format
+$startDate = (Get-Date).ToUniversalTime().AddDays(-$Days).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+Write-Host "`nRetrieving service principal sign-ins from the last $Days days (since $startDate)..." -ForegroundColor Yellow
 
 try {
-    # Get service principal sign-in logs
-    $signInLogs = Get-MgAuditLogSignIn -Filter "signInEventTypes/any(t: t eq 'servicePrincipal') and createdDateTime ge $startDate" -All -ErrorAction Stop
+    # Get service principal sign-in logs using direct API call for better filter support
+    Write-Host "Querying sign-in logs..." -ForegroundColor Yellow
     
-    if (-not $signInLogs -or $signInLogs.Count -eq 0) {
-        # Try alternative approach - get from service principal sign-in logs endpoint
-        Write-Host "Trying alternative endpoint for service principal sign-ins..." -ForegroundColor Yellow
+    $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and createdDateTime ge $startDate&`$top=999"
+    $response = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
+    
+    $signInLogs = @()
+    if ($response.value) {
+        $signInLogs = $response.value
         
-        $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and createdDateTime ge $startDate"
-        $signInLogs = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
-        
-        if ($signInLogs.value) {
-            $signInLogs = $signInLogs.value
+        # Handle pagination
+        while ($response.'@odata.nextLink') {
+            Write-Host "  Fetching more results..." -ForegroundColor Yellow
+            $response = Invoke-MgGraphRequest -Method GET -Uri $response.'@odata.nextLink' -OutputType PSObject
+            if ($response.value) {
+                $signInLogs += $response.value
+            }
         }
     }
+    
+    Write-Host "  Retrieved $($signInLogs.Count) sign-in events" -ForegroundColor Green
 }
 catch {
-    Write-Host "Using beta endpoint for managed identity and service principal sign-ins..." -ForegroundColor Yellow
+    Write-Host "Error with v1.0 endpoint: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "Trying beta endpoint for service principal sign-ins..." -ForegroundColor Yellow
     
     try {
         # Use beta endpoint which has dedicated service principal sign-in logs
@@ -98,8 +191,8 @@ catch {
             
             $results | Sort-Object LastSignInDateTime -Descending | Format-Table -AutoSize
             
-            if ($ExportPath) {
-                $results | Export-Csv -Path $ExportPath -NoTypeInformation
+            if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
+                $results | Export-Csv -Path $ExportPath -NoTypeInformation -Force
                 Write-Host "`nResults exported to: $ExportPath" -ForegroundColor Green
             }
             
@@ -121,26 +214,65 @@ if ($signInLogs -and $signInLogs.Count -gt 0) {
     $results = foreach ($group in $groupedSignIns) {
         $lastSignIn = $group.Group | Sort-Object CreatedDateTime -Descending | Select-Object -First 1
         
+        # Get app registration details
+        $appRegistration = Get-AppRegistrationDetails -AppId $lastSignIn.AppId
+        $appDisplayName = if ($appRegistration) { $appRegistration.displayName } else { "N/A (External/Microsoft App)" }
+        
+        # Get permissions
+        $permissions = Get-ServicePrincipalPermissions -AppId $lastSignIn.AppId
+        $appPermissions = $permissions.Application -join " | "
+        $delegatedPermissions = $permissions.Delegated -join " | "
+        
         [PSCustomObject]@{
-            ServicePrincipalName = $lastSignIn.AppDisplayName
-            AppId                = $lastSignIn.AppId
+            ServicePrincipalName  = $lastSignIn.AppDisplayName
+            AppRegistrationName   = $appDisplayName
+            AppId                 = $lastSignIn.AppId
             LastSignInDateTime   = $lastSignIn.CreatedDateTime
             IPAddress            = $lastSignIn.IPAddress
             Location             = "$($lastSignIn.Location.City), $($lastSignIn.Location.CountryOrRegion)"
             Status               = if ($lastSignIn.Status.ErrorCode -eq 0) { "Success" } else { "Failed: $($lastSignIn.Status.FailureReason)" }
             ResourceDisplayName  = $lastSignIn.ResourceDisplayName
             SignInCount          = $group.Count
+            ApplicationPermissions = $appPermissions
+            DelegatedPermissions   = $delegatedPermissions
         }
     }
     
     # Display results
     Write-Host "`n=== Last Sign-In Activity per Service Principal ===" -ForegroundColor Cyan
-    $results | Sort-Object LastSignInDateTime -Descending | Format-Table -AutoSize
+    $results | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppRegistrationName, AppId, LastSignInDateTime, Status, SignInCount -AutoSize
+    
+    # Display permissions details
+    Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
+    foreach ($result in ($results | Sort-Object LastSignInDateTime -Descending)) {
+        Write-Host "`n$($result.ServicePrincipalName) ($($result.AppId)):" -ForegroundColor White
+        if ($result.ApplicationPermissions) {
+            Write-Host "  Application Permissions:" -ForegroundColor Yellow
+            $result.ApplicationPermissions -split " \| " | ForEach-Object {
+                Write-Host "    - $_" -ForegroundColor Gray
+            }
+        }
+        if ($result.DelegatedPermissions) {
+            Write-Host "  Delegated Permissions:" -ForegroundColor Yellow
+            $result.DelegatedPermissions -split " \| " | ForEach-Object {
+                Write-Host "    - $_" -ForegroundColor Gray
+            }
+        }
+        if (-not $result.ApplicationPermissions -and -not $result.DelegatedPermissions) {
+            Write-Host "  No permissions found" -ForegroundColor DarkGray
+        }
+    }
     
     # Export if path specified
-    if ($ExportPath) {
-        $results | Export-Csv -Path $ExportPath -NoTypeInformation
+    if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
+        $results | Export-Csv -Path $ExportPath -NoTypeInformation -Force
         Write-Host "`nResults exported to: $ExportPath" -ForegroundColor Green
+        
+        # Verify file was created
+        if (Test-Path $ExportPath) {
+            $fileInfo = Get-Item $ExportPath
+            Write-Host "  File size: $($fileInfo.Length) bytes" -ForegroundColor Gray
+        }
     }
     
     # Summary
@@ -167,8 +299,18 @@ try {
     
     if ($spActivities.value) {
         $spResults = foreach ($sp in $spActivities.value) {
+            # Get app registration details
+            $appRegistration = Get-AppRegistrationDetails -AppId $sp.appId
+            $appDisplayName = if ($appRegistration) { $appRegistration.displayName } else { "N/A (External/Microsoft App)" }
+            
+            # Get permissions
+            $permissions = Get-ServicePrincipalPermissions -AppId $sp.appId
+            $appPermissions = $permissions.Application -join " | "
+            $delegatedPermissions = $permissions.Delegated -join " | "
+            
             [PSCustomObject]@{
                 AppId                          = $sp.appId
+                AppRegistrationName            = $appDisplayName
                 ServicePrincipalId             = $sp.id
                 LastSignInDateTime             = $sp.lastSignInActivity.lastSignInDateTime
                 LastSignInRequestId            = $sp.lastSignInActivity.lastSignInRequestId
@@ -176,15 +318,38 @@ try {
                 DelegatedResourceSignIn        = $sp.delegatedResourceSignInActivity.lastSignInDateTime
                 ApplicationCredentialSignIn    = $sp.applicationAuthenticationClientSignInActivity.lastSignInDateTime
                 ManagedIdentitySignIn          = $sp.applicationAuthenticationManagedIdentitySignInActivity.lastSignInDateTime
+                ApplicationPermissions         = $appPermissions
+                DelegatedPermissions           = $delegatedPermissions
             }
         }
         
         Write-Host "`nService Principal Sign-In Activities:" -ForegroundColor Green
-        $spResults | Sort-Object LastSignInDateTime -Descending | Format-Table -AutoSize
+        $spResults | Sort-Object LastSignInDateTime -Descending | Format-Table AppId, AppRegistrationName, LastSignInDateTime -AutoSize
         
-        if ($ExportPath) {
+        # Display permissions details for beta endpoint
+        Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
+        foreach ($result in ($spResults | Sort-Object LastSignInDateTime -Descending)) {
+            Write-Host "`n$($result.AppRegistrationName) ($($result.AppId)):" -ForegroundColor White
+            if ($result.ApplicationPermissions) {
+                Write-Host "  Application Permissions:" -ForegroundColor Yellow
+                $result.ApplicationPermissions -split " \| " | ForEach-Object {
+                    Write-Host "    - $_" -ForegroundColor Gray
+                }
+            }
+            if ($result.DelegatedPermissions) {
+                Write-Host "  Delegated Permissions:" -ForegroundColor Yellow
+                $result.DelegatedPermissions -split " \| " | ForEach-Object {
+                    Write-Host "    - $_" -ForegroundColor Gray
+                }
+            }
+            if (-not $result.ApplicationPermissions -and -not $result.DelegatedPermissions) {
+                Write-Host "  No permissions found" -ForegroundColor DarkGray
+            }
+        }
+        
+        if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
             $detailedPath = $ExportPath -replace '\.csv$', '_detailed.csv'
-            $spResults | Export-Csv -Path $detailedPath -NoTypeInformation
+            $spResults | Export-Csv -Path $detailedPath -NoTypeInformation -Force
             Write-Host "Detailed results exported to: $detailedPath" -ForegroundColor Green
         }
     }
