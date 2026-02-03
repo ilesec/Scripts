@@ -45,20 +45,20 @@ $requiredScopes = @(
     "Application.Read.All"
 )
 
-# Function to get app registration details
-function Get-AppRegistrationDetails {
+# Function to get service principal details
+function Get-ServicePrincipalDetails {
     param(
         [string]$AppId
     )
     
     try {
-        $app = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$AppId'" -OutputType PSObject
-        if ($app.value -and $app.value.Count -gt 0) {
-            return $app.value[0]
+        $sp = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$AppId'" -OutputType PSObject
+        if ($sp.value -and $sp.value.Count -gt 0) {
+            return $sp.value[0]
         }
     }
     catch {
-        # App might be a Microsoft first-party app or external
+        # Service principal might not exist
     }
     
     return $null
@@ -214,9 +214,9 @@ if ($signInLogs -and $signInLogs.Count -gt 0) {
     $results = foreach ($group in $groupedSignIns) {
         $lastSignIn = $group.Group | Sort-Object CreatedDateTime -Descending | Select-Object -First 1
         
-        # Get app registration details
-        $appRegistration = Get-AppRegistrationDetails -AppId $lastSignIn.AppId
-        $appDisplayName = if ($appRegistration) { $appRegistration.displayName } else { "N/A (External/Microsoft App)" }
+        # Get service principal details
+        $spDetails = Get-ServicePrincipalDetails -AppId $lastSignIn.AppId
+        $spDisplayName = if ($spDetails) { $spDetails.displayName } else { $lastSignIn.AppDisplayName }
         
         # Get permissions
         $permissions = Get-ServicePrincipalPermissions -AppId $lastSignIn.AppId
@@ -224,8 +224,7 @@ if ($signInLogs -and $signInLogs.Count -gt 0) {
         $delegatedPermissions = $permissions.Delegated -join " | "
         
         [PSCustomObject]@{
-            ServicePrincipalName  = $lastSignIn.AppDisplayName
-            AppRegistrationName   = $appDisplayName
+            ServicePrincipalName  = $spDisplayName
             AppId                 = $lastSignIn.AppId
             LastSignInDateTime   = $lastSignIn.CreatedDateTime
             IPAddress            = $lastSignIn.IPAddress
@@ -240,7 +239,7 @@ if ($signInLogs -and $signInLogs.Count -gt 0) {
     
     # Display results
     Write-Host "`n=== Last Sign-In Activity per Service Principal ===" -ForegroundColor Cyan
-    $results | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppRegistrationName, AppId, LastSignInDateTime, Status, SignInCount -AutoSize
+    $results | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppId, LastSignInDateTime, Status, SignInCount -AutoSize
     
     # Display permissions details
     Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
@@ -299,9 +298,9 @@ try {
     
     if ($spActivities.value) {
         $spResults = foreach ($sp in $spActivities.value) {
-            # Get app registration details
-            $appRegistration = Get-AppRegistrationDetails -AppId $sp.appId
-            $appDisplayName = if ($appRegistration) { $appRegistration.displayName } else { "N/A (External/Microsoft App)" }
+            # Get service principal details
+            $spDetails = Get-ServicePrincipalDetails -AppId $sp.appId
+            $spDisplayName = if ($spDetails) { $spDetails.displayName } else { "N/A" }
             
             # Get permissions
             $permissions = Get-ServicePrincipalPermissions -AppId $sp.appId
@@ -310,7 +309,7 @@ try {
             
             [PSCustomObject]@{
                 AppId                          = $sp.appId
-                AppRegistrationName            = $appDisplayName
+                ServicePrincipalName           = $spDisplayName
                 ServicePrincipalId             = $sp.id
                 LastSignInDateTime             = $sp.lastSignInActivity.lastSignInDateTime
                 LastSignInRequestId            = $sp.lastSignInActivity.lastSignInRequestId
@@ -324,12 +323,12 @@ try {
         }
         
         Write-Host "`nService Principal Sign-In Activities:" -ForegroundColor Green
-        $spResults | Sort-Object LastSignInDateTime -Descending | Format-Table AppId, AppRegistrationName, LastSignInDateTime -AutoSize
+        $spResults | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppId, LastSignInDateTime -AutoSize
         
         # Display permissions details for beta endpoint
         Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
         foreach ($result in ($spResults | Sort-Object LastSignInDateTime -Descending)) {
-            Write-Host "`n$($result.AppRegistrationName) ($($result.AppId)):" -ForegroundColor White
+            Write-Host "`n$($result.ServicePrincipalName) ($($result.AppId)):" -ForegroundColor White
             if ($result.ApplicationPermissions) {
                 Write-Host "  Application Permissions:" -ForegroundColor Yellow
                 $result.ApplicationPermissions -split " \| " | ForEach-Object {
