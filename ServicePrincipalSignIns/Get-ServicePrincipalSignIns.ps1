@@ -144,107 +144,78 @@ if (-not $context) {
 Write-Host "Connected as: $($context.Account)" -ForegroundColor Green
 Write-Host "Tenant ID: $($context.TenantId)" -ForegroundColor Green
 
-# Calculate the date filter - use UTC and proper ISO 8601 format
-$startDate = (Get-Date).ToUniversalTime().AddDays(-$Days).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-Write-Host "`nRetrieving service principal sign-ins from the last $Days days (since $startDate)..." -ForegroundColor Yellow
+# First, get ALL service principals with their last sign-in activity (this shows historical last sign-in regardless of date)
+Write-Host "`n=== Fetching Last Sign-In Activity for All Service Principals ===" -ForegroundColor Cyan
 
+$allSpResults = @()
 try {
-    # Get service principal sign-in logs using direct API call for better filter support
-    Write-Host "Querying sign-in logs..." -ForegroundColor Yellow
-    
-    $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and createdDateTime ge $startDate&`$top=999"
+    # Get all service principals with sign-in activity (beta API) - this shows the ACTUAL last sign-in date
+    $uri = "https://graph.microsoft.com/beta/reports/servicePrincipalSignInActivities"
     $response = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
     
-    $signInLogs = @()
     if ($response.value) {
-        $signInLogs = $response.value
+        $allSpActivities = @($response.value)
         
         # Handle pagination
         while ($response.'@odata.nextLink') {
-            Write-Host "  Fetching more results..." -ForegroundColor Yellow
+            Write-Host "  Fetching more service principals..." -ForegroundColor Yellow
             $response = Invoke-MgGraphRequest -Method GET -Uri $response.'@odata.nextLink' -OutputType PSObject
             if ($response.value) {
-                $signInLogs += $response.value
+                $allSpActivities += $response.value
+            }
+        }
+        
+        Write-Host "  Found $($allSpActivities.Count) service principals with sign-in activity" -ForegroundColor Green
+        
+        $allSpResults = foreach ($sp in $allSpActivities) {
+            # Get service principal details
+            $spDetails = Get-ServicePrincipalDetails -AppId $sp.appId
+            $spDisplayName = if ($spDetails) { $spDetails.displayName } else { "N/A" }
+            
+            # Get permissions
+            $permissions = Get-ServicePrincipalPermissions -AppId $sp.appId
+            $appPermissions = $permissions.Application -join " | "
+            $delegatedPermissions = $permissions.Delegated -join " | "
+            
+            # Determine the most recent sign-in from all activity types
+            $lastSignInDates = @(
+                $sp.lastSignInActivity.lastSignInDateTime,
+                $sp.delegatedClientSignInActivity.lastSignInDateTime,
+                $sp.delegatedResourceSignInActivity.lastSignInDateTime,
+                $sp.applicationAuthenticationClientSignInActivity.lastSignInDateTime,
+                $sp.applicationAuthenticationManagedIdentitySignInActivity.lastSignInDateTime
+            ) | Where-Object { $_ } | Sort-Object -Descending
+            
+            $mostRecentSignIn = if ($lastSignInDates) { $lastSignInDates[0] } else { $null }
+            
+            [PSCustomObject]@{
+                ServicePrincipalName           = $spDisplayName
+                AppId                          = $sp.appId
+                LastSignInDateTime             = $mostRecentSignIn
+                LastDelegatedClientSignIn      = $sp.delegatedClientSignInActivity.lastSignInDateTime
+                LastDelegatedResourceSignIn    = $sp.delegatedResourceSignInActivity.lastSignInDateTime
+                LastAppCredentialSignIn        = $sp.applicationAuthenticationClientSignInActivity.lastSignInDateTime
+                LastManagedIdentitySignIn      = $sp.applicationAuthenticationManagedIdentitySignInActivity.lastSignInDateTime
+                ApplicationPermissions         = $appPermissions
+                DelegatedPermissions           = $delegatedPermissions
             }
         }
     }
-    
-    Write-Host "  Retrieved $($signInLogs.Count) sign-in events" -ForegroundColor Green
 }
 catch {
-    Write-Host "Error with v1.0 endpoint: $($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Host "Trying beta endpoint for service principal sign-ins..." -ForegroundColor Yellow
-    
-    try {
-        # Use beta endpoint which has dedicated service principal sign-in logs
-        $uri = "https://graph.microsoft.com/beta/auditLogs/servicePrincipalSignInActivities"
-        $response = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
-        
-        if ($response.value) {
-            $results = $response.value | Select-Object @{N='ServicePrincipalId';E={$_.appId}},
-                @{N='ServicePrincipalName';E={$_.servicePrincipalName}},
-                @{N='LastSignInDateTime';E={$_.lastSignInActivity.lastSignInDateTime}},
-                @{N='LastDelegatedSignIn';E={$_.lastSignInActivity.lastDelegatedClientSignInDateTime}},
-                @{N='LastDelegatedResourceSignIn';E={$_.lastSignInActivity.lastDelegatedResourceSignInDateTime}}
-            
-            Write-Host "`nFound $($results.Count) service principals with sign-in activity:" -ForegroundColor Green
-            
-            $results | Sort-Object LastSignInDateTime -Descending | Format-Table -AutoSize
-            
-            if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
-                $results | Export-Csv -Path $ExportPath -NoTypeInformation -Force
-                Write-Host "`nResults exported to: $ExportPath" -ForegroundColor Green
-            }
-            
-            exit 0
-        }
-    }
-    catch {
-        Write-Host "Falling back to standard sign-in logs with service principal filter..." -ForegroundColor Yellow
-    }
+    Write-Host "Note: Beta reports endpoint not available. Error: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
-# Process standard sign-in logs
-if ($signInLogs -and $signInLogs.Count -gt 0) {
-    Write-Host "Found $($signInLogs.Count) sign-in events. Processing..." -ForegroundColor Green
-    
-    # Group by service principal and get last sign-in
-    $groupedSignIns = $signInLogs | Group-Object -Property AppId
-    
-    $results = foreach ($group in $groupedSignIns) {
-        $lastSignIn = $group.Group | Sort-Object CreatedDateTime -Descending | Select-Object -First 1
-        
-        # Get service principal details
-        $spDetails = Get-ServicePrincipalDetails -AppId $lastSignIn.AppId
-        $spDisplayName = if ($spDetails) { $spDetails.displayName } else { $lastSignIn.AppDisplayName }
-        
-        # Get permissions
-        $permissions = Get-ServicePrincipalPermissions -AppId $lastSignIn.AppId
-        $appPermissions = $permissions.Application -join " | "
-        $delegatedPermissions = $permissions.Delegated -join " | "
-        
-        [PSCustomObject]@{
-            ServicePrincipalName  = $spDisplayName
-            AppId                 = $lastSignIn.AppId
-            LastSignInDateTime   = $lastSignIn.CreatedDateTime
-            IPAddress            = $lastSignIn.IPAddress
-            Location             = "$($lastSignIn.Location.City), $($lastSignIn.Location.CountryOrRegion)"
-            Status               = if ($lastSignIn.Status.ErrorCode -eq 0) { "Success" } else { "Failed: $($lastSignIn.Status.FailureReason)" }
-            ResourceDisplayName  = $lastSignIn.ResourceDisplayName
-            SignInCount          = $group.Count
-            ApplicationPermissions = $appPermissions
-            DelegatedPermissions   = $delegatedPermissions
-        }
-    }
-    
-    # Display results
-    Write-Host "`n=== Last Sign-In Activity per Service Principal ===" -ForegroundColor Cyan
-    $results | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppId, LastSignInDateTime, Status, SignInCount -AutoSize
+# Display all service principal results
+if ($allSpResults -and $allSpResults.Count -gt 0) {
+    Write-Host "`nAll Service Principals - Last Sign-In Activity:" -ForegroundColor Green
+    $allSpResults | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppId, LastSignInDateTime, LastAppCredentialSignIn, LastManagedIdentitySignIn -AutoSize
     
     # Display permissions details
     Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
-    foreach ($result in ($results | Sort-Object LastSignInDateTime -Descending)) {
+    foreach ($result in ($allSpResults | Sort-Object LastSignInDateTime -Descending)) {
         Write-Host "`n$($result.ServicePrincipalName) ($($result.AppId)):" -ForegroundColor White
+        Write-Host "  Last Sign-In: $($result.LastSignInDateTime)" -ForegroundColor Gray
         if ($result.ApplicationPermissions) {
             Write-Host "  Application Permissions:" -ForegroundColor Yellow
             $result.ApplicationPermissions -split " \| " | ForEach-Object {
@@ -264,10 +235,9 @@ if ($signInLogs -and $signInLogs.Count -gt 0) {
     
     # Export if path specified
     if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
-        $results | Export-Csv -Path $ExportPath -NoTypeInformation -Force
+        $allSpResults | Export-Csv -Path $ExportPath -NoTypeInformation -Force
         Write-Host "`nResults exported to: $ExportPath" -ForegroundColor Green
         
-        # Verify file was created
         if (Test-Path $ExportPath) {
             $fileInfo = Get-Item $ExportPath
             Write-Host "  File size: $($fileInfo.Length) bytes" -ForegroundColor Gray
@@ -276,86 +246,81 @@ if ($signInLogs -and $signInLogs.Count -gt 0) {
     
     # Summary
     Write-Host "`n=== Summary ===" -ForegroundColor Cyan
-    Write-Host "Total unique service principals: $($results.Count)"
-    Write-Host "Total sign-in events: $($signInLogs.Count)"
-    Write-Host "Date range: Last $Days days"
-}
-else {
-    Write-Host "`nNo service principal sign-ins found in the last $Days days." -ForegroundColor Yellow
-    Write-Host "This could mean:"
-    Write-Host "  - No service principals have signed in during this period"
-    Write-Host "  - Sign-in logs retention period may be shorter"
-    Write-Host "  - You may need additional permissions (AuditLog.Read.All)"
+    Write-Host "Total service principals with sign-in history: $($allSpResults.Count)"
+    
+    # Count by activity type
+    $withAppCredential = ($allSpResults | Where-Object { $_.LastAppCredentialSignIn }).Count
+    $withManagedIdentity = ($allSpResults | Where-Object { $_.LastManagedIdentitySignIn }).Count
+    $withDelegated = ($allSpResults | Where-Object { $_.LastDelegatedClientSignIn -or $_.LastDelegatedResourceSignIn }).Count
+    
+    Write-Host "  With App Credential sign-ins: $withAppCredential"
+    Write-Host "  With Managed Identity sign-ins: $withManagedIdentity"
+    Write-Host "  With Delegated sign-ins: $withDelegated"
 }
 
-# Also get service principals with their last sign-in activity from the applications endpoint
-Write-Host "`n=== Fetching Service Principal Last Sign-In Activity ===" -ForegroundColor Cyan
+# Optionally also show recent sign-in activity from audit logs
+Write-Host "`n=== Recent Sign-In Activity (Last $Days Days) ===" -ForegroundColor Cyan
+$startDate = (Get-Date).ToUniversalTime().AddDays(-$Days).ToString("yyyy-MM-ddTHH:mm:ssZ", [System.Globalization.CultureInfo]::InvariantCulture)
+Write-Host "Querying sign-in logs since $startDate..." -ForegroundColor Yellow
 
 try {
-    # Get all service principals with sign-in activity (beta API)
-    $uri = "https://graph.microsoft.com/beta/reports/servicePrincipalSignInActivities"
-    $spActivities = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
+    $filter = "signInEventTypes/any(t: t eq 'servicePrincipal') and createdDateTime ge $startDate"
+    $uri = "https://graph.microsoft.com/beta/auditLogs/signIns?`$filter=$([System.Web.HttpUtility]::UrlEncode($filter))&`$top=999"
+    $response = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
     
-    if ($spActivities.value) {
-        $spResults = foreach ($sp in $spActivities.value) {
-            # Get service principal details
-            $spDetails = Get-ServicePrincipalDetails -AppId $sp.appId
-            $spDisplayName = if ($spDetails) { $spDetails.displayName } else { "N/A" }
-            
-            # Get permissions
-            $permissions = Get-ServicePrincipalPermissions -AppId $sp.appId
-            $appPermissions = $permissions.Application -join " | "
-            $delegatedPermissions = $permissions.Delegated -join " | "
-            
-            [PSCustomObject]@{
-                AppId                          = $sp.appId
-                ServicePrincipalName           = $spDisplayName
-                ServicePrincipalId             = $sp.id
-                LastSignInDateTime             = $sp.lastSignInActivity.lastSignInDateTime
-                LastSignInRequestId            = $sp.lastSignInActivity.lastSignInRequestId
-                DelegatedClientSignIn          = $sp.delegatedClientSignInActivity.lastSignInDateTime
-                DelegatedResourceSignIn        = $sp.delegatedResourceSignInActivity.lastSignInDateTime
-                ApplicationCredentialSignIn    = $sp.applicationAuthenticationClientSignInActivity.lastSignInDateTime
-                ManagedIdentitySignIn          = $sp.applicationAuthenticationManagedIdentitySignInActivity.lastSignInDateTime
-                ApplicationPermissions         = $appPermissions
-                DelegatedPermissions           = $delegatedPermissions
-            }
-        }
+    $signInLogs = @()
+    if ($response.value) {
+        $signInLogs = $response.value
         
-        Write-Host "`nService Principal Sign-In Activities:" -ForegroundColor Green
-        $spResults | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppId, LastSignInDateTime -AutoSize
-        
-        # Display permissions details for beta endpoint
-        Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
-        foreach ($result in ($spResults | Sort-Object LastSignInDateTime -Descending)) {
-            Write-Host "`n$($result.ServicePrincipalName) ($($result.AppId)):" -ForegroundColor White
-            if ($result.ApplicationPermissions) {
-                Write-Host "  Application Permissions:" -ForegroundColor Yellow
-                $result.ApplicationPermissions -split " \| " | ForEach-Object {
-                    Write-Host "    - $_" -ForegroundColor Gray
-                }
+        # Handle pagination
+        while ($response.'@odata.nextLink') {
+            Write-Host "  Fetching more results..." -ForegroundColor Yellow
+            $response = Invoke-MgGraphRequest -Method GET -Uri $response.'@odata.nextLink' -OutputType PSObject
+            if ($response.value) {
+                $signInLogs += $response.value
             }
-            if ($result.DelegatedPermissions) {
-                Write-Host "  Delegated Permissions:" -ForegroundColor Yellow
-                $result.DelegatedPermissions -split " \| " | ForEach-Object {
-                    Write-Host "    - $_" -ForegroundColor Gray
-                }
-            }
-            if (-not $result.ApplicationPermissions -and -not $result.DelegatedPermissions) {
-                Write-Host "  No permissions found" -ForegroundColor DarkGray
-            }
-        }
-        
-        if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
-            $detailedPath = $ExportPath -replace '\.csv$', '_detailed.csv'
-            $spResults | Export-Csv -Path $detailedPath -NoTypeInformation -Force
-            Write-Host "Detailed results exported to: $detailedPath" -ForegroundColor Green
         }
     }
+    
+    Write-Host "  Retrieved $($signInLogs.Count) sign-in events from the last $Days days" -ForegroundColor Green
 }
 catch {
-    Write-Host "Note: Detailed service principal activity endpoint not available or requires additional permissions." -ForegroundColor Yellow
-    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    Write-Host "Could not retrieve recent sign-in logs: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# Process recent sign-in logs if available (shows additional details like IP, location)
+if ($signInLogs -and $signInLogs.Count -gt 0) {
+    Write-Host "`nRecent sign-in details (last $Days days):" -ForegroundColor Green
+    
+    # Group by service principal and get last sign-in
+    $groupedSignIns = $signInLogs | Group-Object -Property AppId
+    
+    $recentResults = foreach ($group in $groupedSignIns) {
+        $lastSignIn = $group.Group | Sort-Object CreatedDateTime -Descending | Select-Object -First 1
+        
+        [PSCustomObject]@{
+            ServicePrincipalName  = $lastSignIn.AppDisplayName
+            AppId                 = $lastSignIn.AppId
+            LastSignInDateTime    = $lastSignIn.CreatedDateTime
+            IPAddress             = $lastSignIn.IPAddress
+            Location              = "$($lastSignIn.Location.City), $($lastSignIn.Location.CountryOrRegion)"
+            Status                = if ($lastSignIn.Status.ErrorCode -eq 0) { "Success" } else { "Failed: $($lastSignIn.Status.FailureReason)" }
+            ResourceDisplayName   = $lastSignIn.ResourceDisplayName
+            SignInCount           = $group.Count
+        }
+    }
+    
+    $recentResults | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppId, LastSignInDateTime, IPAddress, Status, SignInCount -AutoSize
+    
+    # Export recent activity if path specified
+    if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
+        $recentPath = $ExportPath -replace '\.csv$', '_recent.csv'
+        $recentResults | Export-Csv -Path $recentPath -NoTypeInformation -Force
+        Write-Host "Recent activity exported to: $recentPath" -ForegroundColor Green
+    }
+}
+else {
+    Write-Host "No recent sign-in events found in the last $Days days." -ForegroundColor Yellow
 }
 
 Write-Host "`nScript completed." -ForegroundColor Cyan
