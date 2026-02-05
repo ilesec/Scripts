@@ -21,6 +21,10 @@
 .EXAMPLE
     .\Get-ServicePrincipalSignIns.ps1 -Days 7 -ExportPath "C:\Reports\SPSignIns.csv"
     Lists sign-ins from last 7 days and exports to CSV.
+
+.EXAMPLE
+    .\Get-ServicePrincipalSignIns.ps1 -IncludePermissions
+    Lists sign-ins with detailed permission information (slower).
 #>
 
 [CmdletBinding()]
@@ -30,7 +34,10 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ExportPath = $null
+    [string]$ExportPath = $null,
+
+    [Parameter()]
+    [switch]$IncludePermissions
 )
 
 # Show export path if specified
@@ -147,6 +154,31 @@ Write-Host "Tenant ID: $($context.TenantId)" -ForegroundColor Green
 # First, get ALL service principals with their last sign-in activity (this shows historical last sign-in regardless of date)
 Write-Host "`n=== Fetching Last Sign-In Activity for All Service Principals ===" -ForegroundColor Cyan
 
+# Build a hashtable of all service principals for fast lookup
+Write-Host "  Building service principal cache..." -ForegroundColor Yellow
+$spCache = @{}
+try {
+    $spUri = "https://graph.microsoft.com/v1.0/servicePrincipals?`$select=appId,id,displayName&`$top=999"
+    $spResponse = Invoke-MgGraphRequest -Method GET -Uri $spUri -OutputType PSObject
+    if ($spResponse.value) {
+        foreach ($sp in $spResponse.value) {
+            $spCache[$sp.appId] = $sp
+        }
+        while ($spResponse.'@odata.nextLink') {
+            $spResponse = Invoke-MgGraphRequest -Method GET -Uri $spResponse.'@odata.nextLink' -OutputType PSObject
+            if ($spResponse.value) {
+                foreach ($sp in $spResponse.value) {
+                    $spCache[$sp.appId] = $sp
+                }
+            }
+        }
+    }
+    Write-Host "  Cached $($spCache.Count) service principals" -ForegroundColor Green
+}
+catch {
+    Write-Host "  Could not build SP cache: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
 $allSpResults = @()
 try {
     # Get all service principals with sign-in activity (beta API) - this shows the ACTUAL last sign-in date
@@ -167,15 +199,27 @@ try {
         
         Write-Host "  Found $($allSpActivities.Count) service principals with sign-in activity" -ForegroundColor Green
         
+        $totalCount = $allSpActivities.Count
+        $currentIndex = 0
+        
         $allSpResults = foreach ($sp in $allSpActivities) {
-            # Get service principal details
-            $spDetails = Get-ServicePrincipalDetails -AppId $sp.appId
+            $currentIndex++
+            
+            # Get service principal details from cache (fast)
+            $spDetails = $spCache[$sp.appId]
             $spDisplayName = if ($spDetails) { $spDetails.displayName } else { "N/A" }
             
-            # Get permissions
-            $permissions = Get-ServicePrincipalPermissions -AppId $sp.appId
-            $appPermissions = $permissions.Application -join " | "
-            $delegatedPermissions = $permissions.Delegated -join " | "
+            # Get permissions only if requested (slow operation)
+            $appPermissions = ""
+            $delegatedPermissions = ""
+            if ($IncludePermissions) {
+                if ($currentIndex % 10 -eq 0) {
+                    Write-Host "  Processing permissions: $currentIndex of $totalCount..." -ForegroundColor Yellow
+                }
+                $permissions = Get-ServicePrincipalPermissions -AppId $sp.appId
+                $appPermissions = $permissions.Application -join " | "
+                $delegatedPermissions = $permissions.Delegated -join " | "
+            }
             
             # Determine the most recent sign-in from all activity types
             $lastSignInDates = @(
@@ -184,18 +228,18 @@ try {
                 $sp.delegatedResourceSignInActivity.lastSignInDateTime,
                 $sp.applicationAuthenticationClientSignInActivity.lastSignInDateTime,
                 $sp.applicationAuthenticationManagedIdentitySignInActivity.lastSignInDateTime
-            ) | Where-Object { $_ } | Sort-Object -Descending
+            ) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Descending
             
-            $mostRecentSignIn = if ($lastSignInDates) { $lastSignInDates[0] } else { $null }
+            $mostRecentSignIn = if ($lastSignInDates) { [string]$lastSignInDates[0] } else { $null }
             
             [PSCustomObject]@{
                 ServicePrincipalName           = $spDisplayName
                 AppId                          = $sp.appId
                 LastSignInDateTime             = $mostRecentSignIn
-                LastDelegatedClientSignIn      = $sp.delegatedClientSignInActivity.lastSignInDateTime
-                LastDelegatedResourceSignIn    = $sp.delegatedResourceSignInActivity.lastSignInDateTime
-                LastAppCredentialSignIn        = $sp.applicationAuthenticationClientSignInActivity.lastSignInDateTime
-                LastManagedIdentitySignIn      = $sp.applicationAuthenticationManagedIdentitySignInActivity.lastSignInDateTime
+                LastDelegatedClientSignIn      = [string]$sp.delegatedClientSignInActivity.lastSignInDateTime
+                LastDelegatedResourceSignIn    = [string]$sp.delegatedResourceSignInActivity.lastSignInDateTime
+                LastAppCredentialSignIn        = [string]$sp.applicationAuthenticationClientSignInActivity.lastSignInDateTime
+                LastManagedIdentitySignIn      = [string]$sp.applicationAuthenticationManagedIdentitySignInActivity.lastSignInDateTime
                 ApplicationPermissions         = $appPermissions
                 DelegatedPermissions           = $delegatedPermissions
             }
@@ -211,25 +255,27 @@ if ($allSpResults -and $allSpResults.Count -gt 0) {
     Write-Host "`nAll Service Principals - Last Sign-In Activity:" -ForegroundColor Green
     $allSpResults | Sort-Object LastSignInDateTime -Descending | Format-Table ServicePrincipalName, AppId, LastSignInDateTime, LastAppCredentialSignIn, LastManagedIdentitySignIn -AutoSize
     
-    # Display permissions details
-    Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
-    foreach ($result in ($allSpResults | Sort-Object LastSignInDateTime -Descending)) {
-        Write-Host "`n$($result.ServicePrincipalName) ($($result.AppId)):" -ForegroundColor White
-        Write-Host "  Last Sign-In: $($result.LastSignInDateTime)" -ForegroundColor Gray
-        if ($result.ApplicationPermissions) {
-            Write-Host "  Application Permissions:" -ForegroundColor Yellow
-            $result.ApplicationPermissions -split " \| " | ForEach-Object {
-                Write-Host "    - $_" -ForegroundColor Gray
+    # Display permissions details only if requested
+    if ($IncludePermissions) {
+        Write-Host "`n=== Permissions Details ===" -ForegroundColor Cyan
+        foreach ($result in ($allSpResults | Sort-Object LastSignInDateTime -Descending)) {
+            Write-Host "`n$($result.ServicePrincipalName) ($($result.AppId)):" -ForegroundColor White
+            Write-Host "  Last Sign-In: $($result.LastSignInDateTime)" -ForegroundColor Gray
+            if ($result.ApplicationPermissions) {
+                Write-Host "  Application Permissions:" -ForegroundColor Yellow
+                $result.ApplicationPermissions -split " \| " | ForEach-Object {
+                    Write-Host "    - $_" -ForegroundColor Gray
+                }
             }
-        }
-        if ($result.DelegatedPermissions) {
-            Write-Host "  Delegated Permissions:" -ForegroundColor Yellow
-            $result.DelegatedPermissions -split " \| " | ForEach-Object {
-                Write-Host "    - $_" -ForegroundColor Gray
+            if ($result.DelegatedPermissions) {
+                Write-Host "  Delegated Permissions:" -ForegroundColor Yellow
+                $result.DelegatedPermissions -split " \| " | ForEach-Object {
+                    Write-Host "    - $_" -ForegroundColor Gray
+                }
             }
-        }
-        if (-not $result.ApplicationPermissions -and -not $result.DelegatedPermissions) {
-            Write-Host "  No permissions found" -ForegroundColor DarkGray
+            if (-not $result.ApplicationPermissions -and -not $result.DelegatedPermissions) {
+                Write-Host "  No permissions found" -ForegroundColor DarkGray
+            }
         }
     }
     
@@ -296,12 +342,12 @@ if ($signInLogs -and $signInLogs.Count -gt 0) {
     $groupedSignIns = $signInLogs | Group-Object -Property AppId
     
     $recentResults = foreach ($group in $groupedSignIns) {
-        $lastSignIn = $group.Group | Sort-Object CreatedDateTime -Descending | Select-Object -First 1
+        $lastSignIn = $group.Group | Sort-Object { [string]$_.createdDateTime } -Descending | Select-Object -First 1
         
         [PSCustomObject]@{
             ServicePrincipalName  = $lastSignIn.AppDisplayName
             AppId                 = $lastSignIn.AppId
-            LastSignInDateTime    = $lastSignIn.CreatedDateTime
+            LastSignInDateTime    = [string]$lastSignIn.createdDateTime
             IPAddress             = $lastSignIn.IPAddress
             Location              = "$($lastSignIn.Location.City), $($lastSignIn.Location.CountryOrRegion)"
             Status                = if ($lastSignIn.Status.ErrorCode -eq 0) { "Success" } else { "Failed: $($lastSignIn.Status.FailureReason)" }
