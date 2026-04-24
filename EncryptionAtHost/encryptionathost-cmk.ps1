@@ -1,7 +1,17 @@
 # This script enables EncryptionAtHost on all eligible VMs in the specified subscription.
+# Prerequisites: A Key Vault with a Key and a Disk Encryption Set (DES) configured to use that Key.
 # Familirize yourself with the restrictions and requirements: https://learn.microsoft.com/en-us/azure/virtual-machines/disks-enable-host-based-encryption-portal?tabs=azure-powershell 
 Connect-AzAccount
-Set-AzContext -SubscriptionId "Your subscriptionId here"
+Set-AzContext -SubscriptionId "<your subscriptionId here>"
+
+# ============================================
+# CONFIGURATION - Customer Managed Keys (CMK)
+# ============================================
+# Specify the Disk Encryption Set resource ID for CMK
+$diskEncryptionSetId = "/subscriptions/<your subscriptionId here>/resourceGroups/<your resource group name>/providers/Microsoft.Compute/diskEncryptionSets/<your disk encryption set name>"
+
+# Set to $true to apply CMK to disks, $false to only enable EncryptionAtHost
+$enableCMK = $true
 
 #Register the feature in the subscription. This is a one-time operation per subscription.
 Register-AzProviderFeature -ProviderNamespace "Microsoft.Compute" -FeatureName "EncryptionAtHost"
@@ -43,19 +53,43 @@ foreach ($vm in (Get-AzVM -Status)) {
         continue
     }
 
-    # 4. Check OS disk for Disk Encryption Set
+    # 4. Check OS disk for Disk Encryption Set (skip if already has CMK and we're not re-applying)
     $osDiskId = $vm.StorageProfile.OSDisk.ManagedDisk.Id
     # Parse resource ID to extract disk name and resource group
     $osDiskName = $osDiskId.Split('/')[-1]
     $osDiskRg   = ($osDiskId -split '/resourceGroups/')[1].Split('/')[0]
     $osDisk     = Get-AzDisk -ResourceGroupName $osDiskRg -DiskName $osDiskName
 
-    if ($osDisk.Encryption -and $osDisk.Encryption.DiskEncryptionSetId) {
-        Write-Host "  -> Skipped: Disk Encryption Set detected"
+    $existingDES = $osDisk.Encryption.DiskEncryptionSetId
+    if ($existingDES -and (-not $enableCMK)) {
+        Write-Host "  -> Skipped: Disk Encryption Set already configured"
         continue
     }
 
     # --- All conditions met ---
+    $appliedCMK = $false
+
+    # Apply CMK to OS disk if enabled
+    if ($enableCMK -and $diskEncryptionSetId -notlike "*<*") {
+        Write-Host "  -> Applying CMK to OS disk: $osDiskName"
+        
+        $osDiskConfig = New-AzDiskUpdateConfig -EncryptionType "EncryptionAtRestWithCustomerKey" -DiskEncryptionSetId $diskEncryptionSetId
+        Update-AzDisk -ResourceGroupName $osDiskRg -DiskName $osDiskName -DiskUpdate $osDiskConfig | Out-Null
+        $appliedCMK = $true
+
+        # Apply CMK to all data disks
+        foreach ($dataDisk in $vm.StorageProfile.DataDisks) {
+            $dataDiskId   = $dataDisk.ManagedDisk.Id
+            $dataDiskName = $dataDiskId.Split('/')[-1]
+            $dataDiskRg   = ($dataDiskId -split '/resourceGroups/')[1].Split('/')[0]
+            
+            Write-Host "  -> Applying CMK to data disk: $dataDiskName"
+            $dataDiskConfig = New-AzDiskUpdateConfig -EncryptionType "EncryptionAtRestWithCustomerKey" -DiskEncryptionSetId $diskEncryptionSetId
+            Update-AzDisk -ResourceGroupName $dataDiskRg -DiskName $dataDiskName -DiskUpdate $dataDiskConfig | Out-Null
+        }
+    }
+
+    # Enable EncryptionAtHost
     Write-Host "  -> Enabling EncryptionAtHost"
 
     $vm.SecurityProfile = @{
@@ -68,8 +102,9 @@ foreach ($vm in (Get-AzVM -Status)) {
         VMName           = $vmName
         ResourceGroup    = $rg
         PowerState       = $state
-        EncryptionAtHost = "Enabled (model)"
-        DES              = "No"
+        EncryptionAtHost = "Enabled"
+        CMK              = if ($appliedCMK) { "Applied" } else { "No" }
+        DataDisks        = $vm.StorageProfile.DataDisks.Count
         ADE              = "No"
         ActionTaken      = "Updated"
     }
